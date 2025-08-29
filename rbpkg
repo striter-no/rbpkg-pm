@@ -1,0 +1,270 @@
+#!/usr/bin/env python3
+import requests, tarfile
+import argparse, stat, os, shutil
+
+ENVIRONMENT = f"/home/{os.getlogin()}/.reborn-client"
+CONFIG_CONT: dict = {}
+
+def install(package: str):
+    print(f"[rbpkg] requesting {package}...")
+    resp = requests.get(
+        CONFIG_CONT["url"] + "/api/client",
+        params = {
+            "name": package,
+            "action": "install"
+        }
+    )
+
+    if resp.status_code != 200:
+        data = resp.json()
+        if data["error"] == "NO-SUCH-PKG":
+            print(f"[rbpkg] requested package does not exist")
+            exit(1)
+        
+        print(f"[rbpkg][{resp.status_code}] install request failed: ")
+        print(data["display"])
+        print(f"\n{data["error"]} ({data["code"]})")
+        exit(data["code"])
+
+    _version_control = os.path.join(ENVIRONMENT, ".versions")
+    if os.path.exists(_version_control):
+        with open(_version_control) as f:
+            _lcont = f.read().strip()
+            versions = {name.strip(): key.strip() for (name, key) in [
+                l.split(':', 1) for l in _lcont.split('\n') if len(l) != 0
+            ]}
+    else:
+        versions = dict()
+
+    checkresp = requests.get(
+        CONFIG_CONT["url"] + "/api/client",
+        params = {
+            "name": package,
+            "action": "check"
+        }
+    )
+
+    data = checkresp.json()
+
+    if checkresp.status_code != 200:
+        print(f"[rbpkg][{checkresp.status_code}] check request failed: ")
+        print(data["display"])
+        print(f"\n{data["error"]} ({data["code"]})")
+        exit(data["code"])
+    
+    new_ver = data["metadata"]["branch"] + ':' + data["metadata"]["version"]
+    if package in versions and versions[package] != new_ver:
+        print(f"[rbpkg][warning] changing version: {versions[package]} -> {new_ver}")
+    versions[package] = new_ver
+
+    downloads_d = os.path.join(ENVIRONMENT, ".downloads")
+    print(f"[rbpkg] saving to tmp file: {os.path.join(downloads_d, f"{package}.tar")}")
+
+    os.makedirs(downloads_d, exist_ok = True)
+    with open(os.path.join(downloads_d, f"{package}.tar"), 'wb') as f:
+        f.write(resp.content)
+
+    print(f"[rbpkg] extracting and installing")
+    with tarfile.open(os.path.join(downloads_d, f"{package}.tar"), 'r') as arch:
+        arch.extractall(path = os.path.join(downloads_d, package))
+
+    prev_dir = os.getcwd()
+    os.chdir(os.path.join(downloads_d, package))
+    
+    st = os.stat("rbpkg.install")
+    os.chmod("rbpkg.install", st.st_mode | stat.S_IEXEC)
+    
+    print(f"[rbpkg] running install script")
+    installation = os.system("./rbpkg.install")
+    if installation != 0:
+        print("[rbpkg] installation aborted")
+        exit(3)
+
+    os.chdir(prev_dir)
+
+    print(f"[rbpkg] fixing package in stable directory")
+    os.makedirs(os.path.join(ENVIRONMENT, ".bin"), exist_ok = True)
+    for el in os.listdir(
+        os.path.join(downloads_d, package, "bin")
+    ):
+        print(f"[rbpkg] moving new bin: {el}...")
+        if os.path.exists(os.path.join(ENVIRONMENT, ".bin", el)):
+            _repl = input(f"[rbpkg][installation] replace old \"{el}\" with new? [Y/n] ") or "Y"
+            if _repl != "Y":
+                continue
+            os.remove(os.path.join(ENVIRONMENT, ".bin", el))
+
+        shutil.move(
+            os.path.join(downloads_d, package, "bin", el),
+            os.path.join(ENVIRONMENT, ".bin"),
+        )
+
+    os.remove(os.path.join(downloads_d, f"{package}.tar"))
+    shutil.rmtree(os.path.join(downloads_d, package))
+
+    with open(_version_control, 'w') as f:
+        f.write("\n".join([f"{k}:{v}" for (k, v) in versions.items()]))
+
+    print(f"[rbpkg][install] complete")
+
+def update(package: str):
+    print(f"[rbpkg] requesting {package}...")
+
+    checkresp = requests.get(
+        CONFIG_CONT["url"] + "/api/client",
+        params = {
+            "name": package,
+            "action": "check"
+        }
+    )
+
+    data = checkresp.json()
+
+    if checkresp.status_code != 200:
+        print(f"[rbpkg][{checkresp.status_code}] check request failed: ")
+        print(data["display"])
+        print(f"\n{data["error"]} ({data["code"]})")
+        exit(data["code"])
+    
+    _version_control = os.path.join(ENVIRONMENT, ".versions")
+    if os.path.exists(_version_control):
+        with open(_version_control) as f:
+            _lcont = f.read().strip()
+            versions = {name.strip(): key.strip() for (name, key) in [
+                l.split(':', 1) for l in _lcont.split('\n') if len(l) != 0
+            ]}
+    else:
+        versions = dict()
+
+    new_ver = data["metadata"]["branch"] + ':' + data["metadata"]["version"]
+    if package in versions and versions[package] != new_ver:
+        print(f"[rbpkg][update] will change version: {versions[package]} -> {new_ver}")
+        _cont = input("[rbpkg] continue? [Y/n]") or "Y"
+        if _cont != "Y":
+            print(f"[rbpkg][{package}] update aborted")
+            exit()
+    elif package in versions and versions[package] == new_ver:
+        print(f"[rbpkg][update] nothing to update")
+    versions[package] = new_ver
+
+    install(package)
+
+    with open(_version_control, 'w') as f:
+        f.write("\n".join([f"{k}:{v}" for (k, v) in versions.items()]))
+    
+    print(f"[rbpkg][update] complete")
+
+def symlink(bin: str):
+    print(f"[rbpkg] checking for the existance of \"{bin}\" binary...")
+    if os.path.exists(os.path.join(ENVIRONMENT, ".bin", bin)):
+        print(f"[rbpkg] creating symbolic link: {os.path.join(ENVIRONMENT, ".bin", bin)} -> ./{bin}")
+        os.symlink(os.path.join(ENVIRONMENT, ".bin", bin), f"./{bin}")
+    else:
+        print(f"[rbpkg] no such binary file in {os.path.join(ENVIRONMENT, ".bin")}")
+        exit(-4)
+
+def check(package: str):
+    resp = requests.get(
+        CONFIG_CONT["url"] + "/api/client",
+        params = {
+            "name": package,
+            "action": "check"
+        }
+    )
+
+    data = resp.json()
+
+    if resp.status_code != 200:
+        print(f"[reborn][{resp.status_code}] check request failed: ")
+        print(data["display"])
+        print(f"\n{data["error"]} ({data["code"]})")
+        exit(data["code"])
+    
+    metadata = data["metadata"]
+    if metadata["exists"]:
+        print(f"package: {package}\nbranch: {metadata["branch"]}\nversion: {metadata["version"]}\n\n{metadata["readme"]}")
+    else:
+        print(f"package: {package} not exists")
+        exit(1)
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "-e", "--environ",
+        required = False,
+        type = str,
+        default = f"/home/{os.getlogin()}/.reborn-client",
+        help = "Path to the client enviroment"
+    )
+    
+    parser.add_argument(
+        "-i", "--install",
+        required = False,
+        type = str,
+        help = "Install new package"
+    )
+
+    parser.add_argument(
+        "-c", "--check",
+        required = False,
+        action = "store",
+        help = "Check metadata of the package"
+    )
+
+    parser.add_argument(
+        "-u", "--update",
+        required = False,
+        type = str,
+        help = "Soft&Safe update for the package"
+    )
+
+    parser.add_argument(
+        "-s", "--sym",
+        required = False,
+        type = str,
+        help = "Make symbolic link in current directory for the installed binary file"
+    )
+
+    args = parser.parse_args()
+    if args.environ:
+        ENVIRONMENT = args.environ
+
+    if not os.path.exists(os.path.join(ENVIRONMENT, ".rbpkg_config")):
+        os.makedirs(ENVIRONMENT, exist_ok = True)
+
+        print(f"[warning] configuration file does not exists in enviroment ({ENVIRONMENT})")
+        url = input(f"\tinput url of the packages server (http://IP:PORT): ")
+        with open(os.path.join(ENVIRONMENT, ".rbpkg_config"), 'w') as f:
+            f.write(f"url:{url}")
+        print(f"[warning] new configuration file created\n")
+
+    with open(os.path.join(ENVIRONMENT, ".rbpkg_config")) as f:
+        _lcont = f.read().strip()
+        CONFIG_CONT = {name.strip(): key.strip() for (name, key) in [
+            l.split(':', 1) for l in _lcont.split('\n') if len(l) != 0
+        ]}
+
+    CONFIG_CONT["url"] = CONFIG_CONT["url"] if CONFIG_CONT["url"][-1] != "/" else CONFIG_CONT["url"][:-1]
+
+    if args.install:
+        try:
+            install(args.install)
+        except requests.exceptions.ConnectionError:
+            print(f"[error][install] client cannot connect to the rbpkg-pm server via config-provided\n\tconfig path: {os.path.join(ENVIRONMENT, ".rbpkg_config")}\n\turl: {CONFIG_CONT["url"]}")
+    if args.check:
+        try:
+            check(args.check)
+        except requests.exceptions.ConnectionError:
+            print(f"[error][check] client cannot connect to the rbpkg-pm server via config-provided\n\tconfig path: {os.path.join(ENVIRONMENT, ".rbpkg_config")}\n\turl: {CONFIG_CONT["url"]}")
+    if args.update:
+        try:
+            update(args.update)
+        except requests.exceptions.ConnectionError:
+            print(f"[error][update] client cannot connect to the rbpkg-pm server via config-provided\n\tconfig path: {os.path.join(ENVIRONMENT, ".rbpkg_config")}\n\turl: {CONFIG_CONT["url"]}")
+    
+    if args.sym:
+        symlink(args.sym)
+    
+    if not any([args.install, args.check, args.update, args.sym]):
+        print(f"[rbpkg][error] no action specified")
+        exit(-3)

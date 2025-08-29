@@ -1,0 +1,642 @@
+#!/usr/bin/env python3
+from src.server.status import ComposeError, ERROR_CODES
+
+import os, string, shutil, tarfile, uuid, argparse
+import src.server.database as db
+import src.server.package as pkg
+import aiohttp, asyncio, logging
+
+from flask import Flask, request, jsonify, send_file
+
+from werkzeug.utils import secure_filename
+
+log = logging.getLogger('werkzeug')
+log.setLevel(logging.ERROR)  # Hide INFO/WARNING
+logging.getLogger('flask.app').setLevel(logging.ERROR)
+
+PUBLIC_IP     = "http://127.0.0.1:9000"
+ENV_PATH      = "./serv-env"
+PACKAGES_PATH = "./packages"
+TEMP_PATH     = "./.temporal"
+DISTROS_PATH  = "./.distros"
+NO_DISTRIBUTION = False
+
+ALLOWED_EXT = {"tar"} # "bz2", "gz", "xz"
+
+app = Flask(__name__)
+app.config["UPLOAD_FOLDER"] = f"{ENV_PATH}/.runtime/uploads"
+
+def clear_temporal():
+    for el in os.listdir(os.path.join(ENV_PATH, TEMP_PATH)):
+        os.remove(
+            os.path.join(os.path.join(ENV_PATH, TEMP_PATH), el)
+        )
+
+def script_template(script: str, name: str, wdir: str, exename: str):
+    return \
+f"""#!/bin/bash
+echo "[rbpkg] welcome"
+
+if [ "$(command -v python)" ]; then
+    PYTHON_CMD="python"
+elif [ "$(command -v python3)" ]; then
+    PYTHON_CMD="python3"
+else
+    echo "[rbpkg] python (or python3) is not presented in the current system" >&2
+    exit 1
+fi
+
+echo "[rbpkg] installing {name} from {PUBLIC_IP}"
+curl -s -o {script}.tar {PUBLIC_IP}/distribute?type={name}
+echo "[rbpkg] got {script}.tar"
+
+echo "[rbpkg] {name} will install in ./.{wdir}"
+mkdir ./.{wdir}
+mv ./{script}.tar ./.{wdir}
+
+cd ./.{wdir}
+tar -xf ./{script}.tar
+rm -f ./{script}.tar
+
+printf "[rbpkg] create python venv? [Y/n] "
+read -r dovenv < /dev/tty
+
+if [ "$dovenv" != "n" ]; then
+    echo "[warning][rbpkg] installing venv in reborn-{name} dir"
+    $PYTHON_CMD -m venv venv
+fi
+
+$PYTHON_CMD -m venv venv
+echo "[rbpkg] installing python requirements"
+source ./venv/bin/activate
+pip install -r requirements.txt
+deactivate
+
+cd ..
+
+echo "[rbpkg] making twin"
+cat > {exename} << EOF
+#!/bin/bash
+source $(pwd)/.{wdir}/venv/bin/activate
+$(pwd)/.{wdir}/{exename} "\\$@"
+deactivate
+EOF
+
+cat > wiper.{wdir} << EOF
+#!/bin/bash
+echo "[wiper] wiping twin"
+rm -f $(pwd)/{exename}
+echo "[wiper] wiping .{wdir}"
+rm -rf $(pwd)/.{wdir}
+echo "[wiper] wiping update"
+rm -f $(pwd)/update
+echo "[wiper] wiping myself"
+rm -f $(pwd)/wiper
+echo "[wiper] done"
+EOF
+
+cat > update.{wdir} << EOF
+#!/bin/bash
+echo "[update] calling wiper.{wdir}"
+./wiper.{wdir}
+echo "[update] calling update script"
+curl -s {PUBLIC_IP}/scripts/{script} | bash
+echo "[update] done"
+EOF
+
+chmod +x ./{exename}
+chmod +x ./wiper.{wdir}
+chmod +x ./update.{wdir}
+
+echo "[rbpkg] all done"
+"""
+
+def prepare_distros():
+    if NO_DISTRIBUTION:
+        return
+    
+    _distro_path = os.path.join(ENV_PATH, DISTROS_PATH)
+    if os.path.exists(_distro_path):
+        shutil.rmtree(_distro_path)
+
+    os.makedirs(_distro_path)
+    os.system(f"pip freeze > {os.path.join(_distro_path, "requirements.txt")}")
+    shutil.copy("./rbpkg", os.path.join(_distro_path, "./rbpkg"))
+    shutil.copy("./rbpkg-serv", os.path.join(_distro_path, "./rbpkg-serv"))
+    shutil.copy("./rbpkg-upl", os.path.join(_distro_path, "./rbpkg-upl"))
+    shutil.copytree("./src", os.path.join(_distro_path, "./src"))
+
+    def _py_filter(tobj: tarfile.TarInfo):
+        name = os.path.basename(tobj.name)
+        if name in ["venv", "__pycache__", ".protected"]:
+            return None
+        return tobj
+
+    curr_dir = os.getcwd()
+    os.chdir(_distro_path)
+    # Prepare client.tar
+    with tarfile.open("./client.tar", "w") as arch:
+        arch.add("./requirements.txt")
+        arch.add("./rbpkg")
+
+    # Prepare upload.tar
+    with tarfile.open("./upload.tar", "w") as arch:
+        arch.add("./requirements.txt")
+        arch.add("./rbpkg-upl")
+        arch.add("./src/uploader", filter=_py_filter)
+
+    # Prepare server.tar
+    with tarfile.open("./server.tar", "w") as arch:
+        arch.add("./requirements.txt")
+        arch.add("./rbpkg-serv")
+        arch.add("./src/server", filter=_py_filter)
+
+    shutil.rmtree("./src")
+    os.remove("./rbpkg")
+    os.remove("./rbpkg-serv")
+    os.remove("./rbpkg-upl")
+    os.remove("./requirements.txt")
+
+    with open("./client.sh", "w") as f:
+        f.write(script_template("client", "client", "rbcli", "rbpkg"))
+
+    with open("./server.sh", "w") as f:
+        f.write(script_template("server", "server", "rbserv", "rbpkg-serv"))
+
+    with open("./upload.sh", "w") as f:
+        f.write(script_template("upload", "uploader", "rbupl", "rbpkg-upl"))
+
+    os.chdir(curr_dir)
+
+def pkg_name_formating(name: str) -> tuple[bool, str]:
+    if len(name) < 2:
+        return False, "package name is too small (less than 2 symbols)"
+    
+    if len(name) > 20:
+        return False, "package name is too big (more than 20 symbols)"
+
+    if any([s not in string.ascii_letters + string.digits + "_-" for s in name]):
+        return False, "package name contains restricted symbols (are allowed a-Z 0-9 and '_-')"
+    
+    return True, "ok"
+
+def check_version_formatting(ver: str) -> tuple[bool, str]:    
+    if ver.count('.') != 2:
+        return False, "version string must contain 3 digits with 2 separating dots: \"branch:1.2.3\""
+    if ver.count(':') != 1:
+        return False, "version string must contain \":\" after branch name and before version: \"branch:1.2.3\""
+    
+    branch, version = ver.split(':')
+    if branch not in ["stable", "dev", "test"]:
+        return False, "branch can be only one of: \"stable\", \"dev\", \"test\""
+
+    if not all([num.isnumeric() for num in version.split('.')]):
+        return False, "version must contain only digits between dots: \"1.2.3\""
+
+    return True, "ok"
+
+def package_exists(name: str):
+    return name in packages_db.all()
+
+def pkg_newreg(name: str, version: str, readme: str, api_key: str | None = None):
+    data = packages_db.get(name)
+    if data is None:
+        ldata = {
+            "version": version,
+            "readme": readme,
+            "api": api_key
+        }
+
+        packages_db.set(name, ldata)
+    else:
+        data["version"] = version
+        data["readme"] = readme
+        if api_key:
+            data["api"] = api_key
+        
+        packages_db.set(name, data)
+
+def get_package_key(name: str):
+    return packages_db.get(name)["api"]
+
+def pkg_metadata(name: str):
+    _pkg = packages_db.get(name)
+    if _pkg is None:
+        return {"exists": False}
+    
+    branch, ver = _pkg["version"].split(':')
+    return {
+        "exists": True,
+        "version": ver,
+        "branch": branch,
+        "readme": _pkg["readme"]
+    }
+
+async def _server_check_for(serv_domain: str, pkg: str) -> dict:
+    async with aiohttp.ClientSession(base_url=f"http://{serv_domain}") as session:
+        async with session.post("/api/server", params = {
+            "type": "check-for",
+            "name": pkg
+        }) as req:
+            data = (await req.json())["metadata"]
+            status = data["status"]
+            metadata = data["metadata"]
+
+            return {
+                "status": status,
+                "metadata": metadata
+            }
+
+async def _server_copy_pkg(serv_domain: str, pkg: str) -> dict:
+    async with aiohttp.ClientSession(base_url=f"http://{serv_domain}") as session:
+        async with session.post("/api/server", params = {
+            "type": "copy-pkg",
+            "name": pkg
+        }) as req:
+            if req.status == 209:
+                return {"status": "not-exists"}
+            if req.status == 200:
+
+                tmp_name = str(uuid.uuid4())
+                with open(
+                    os.path.join(ENV_PATH, TEMP_PATH, tmp_name + ".tar"),
+                    'wb'
+                ) as f:
+                    async for chunk in req.content.iter_chunked(1024):
+                        f.write(chunk)
+                
+                return {
+                    "status": "exists",
+                    "temp-name": tmp_name
+                }
+            return {
+                "status": "error"
+            }
+
+async def _server_hello(serv_domain: str) -> bool:
+    try:
+        async with aiohttp.ClientSession(base_url=f"http://{serv_domain}") as session:
+            async with session.post("/api/server", params = {
+                "type": "hello"
+            }) as req:
+                data = await req.json()
+                if data["error"] == "OK":
+                    servers_db.set(
+                        serv_domain, 
+                        {"status": "exists"}
+                    )
+                    return True
+                else:
+                    return False
+    except:
+        servers_db.set(
+            serv_domain, 
+            {"status": "not-exists"}
+        )
+        return False
+
+def sync_serv_hello(serv_domain: str) -> bool:
+    return asyncio.run(_server_hello(serv_domain))
+
+@app.route("/api/uploader", methods=["POST"])
+async def uploader_api():
+    pkg_name = request.args.get("name")
+    if pkg_name is None:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
+
+    status, reason = pkg_name_formating(pkg_name)
+    if not status:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_PKG_NAME, reason)), 403
+
+    api_key = request.args.get("key")
+    if api_key is None and package_exists(pkg_name):
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_API_KEY)), 403
+    
+    if api_key is not None and api_key != get_package_key(pkg_name):
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_API_KEY)), 403
+
+    if 'file' not in request.files:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_INPUT_FILES)), 403
+    
+    file = request.files['file']
+    if file.filename is None or file.filename == '':
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.EMPTY_FILENAME)), 403
+
+    ver: str = ""
+    readme: str = ""
+    if file and file.filename.rsplit('.', 1)[1] in ALLOWED_EXT:
+        filename = secure_filename(file.filename)
+        
+        path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(path)
+
+        current_pkg = tarfile.open(path, 'r')
+        status, reason = pkg.check_package(current_pkg)
+        if not status:
+            current_pkg.close()
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, reason)), 403
+
+        os.makedirs(os.path.join(
+            ENV_PATH, TEMP_PATH
+        ), exist_ok = True)
+
+        memb = current_pkg.getmember("rbpkg.version")
+        version_f = current_pkg.extractfile(memb)
+        try:
+            ver = version_f.read().decode("utf-8") or ""
+        except:
+            current_pkg.close()
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, "version should be encoded via utf-8 encoding")), 403
+
+        status, reason = check_version_formatting(ver)
+        if not status:
+            current_pkg.close()
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, reason)), 403
+
+        memb = current_pkg.getmember("README")
+        readme_f = current_pkg.extractfile(memb)
+        try:
+            readme = readme_f.read().decode("utf-8") or ""
+        except:
+            current_pkg.close()
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, "readme should be encoded via utf-8 encoding")), 403
+
+        current_pkg.close()
+        shutil.move(path, os.path.join(ENV_PATH, PACKAGES_PATH, pkg_name + ".tar"))
+    else:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.DISALLOWED_FILE, ALLOWED_EXT)), 403
+
+    api_key = api_key or str(uuid.uuid4())
+    pkg_newreg(
+        name = pkg_name,
+        api_key = api_key,
+        version = ver,
+        readme = readme
+    )
+
+    return jsonify(ComposeError.by_errcode(ERROR_CODES.UPLOADED_SUCCSESFULL, api_key)), 200
+
+@app.route("/api/client")
+async def client_api():
+    pkg_name = request.args.get("name")
+    action   = request.args.get("action")
+
+    if pkg_name is None:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
+
+    status, reason = pkg_name_formating(pkg_name)
+    if not status:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_PKG_NAME, reason)), 403
+
+    if action not in ["install", "check"]:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, action)), 403
+
+    if action == "install":
+        if not package_exists(pkg_name):
+            for serv in servers_db.all():
+                _metadata: dict = await _server_copy_pkg(serv, pkg_name)
+                if _metadata["status"] == "exists":
+                    resp = send_file(
+                        os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"), 
+                        as_attachment=True
+                    )
+                    resp.call_on_close(
+                        lambda: os.remove(os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"))
+                    )
+
+                    return resp, 200
+            
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_SUCH_PKG)), 403
+
+        return send_file(
+            os.path.join(ENV_PATH, PACKAGES_PATH, pkg_name + ".tar"), 
+            as_attachment=True
+        )
+    elif action == "check":
+        _origin_metadata = pkg_metadata(pkg_name)
+
+        if _origin_metadata["exists"]:
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REQUEST_OK, _origin_metadata)), 200
+        else:
+            for serv in servers_db.all():
+                _metadata: dict = await _server_check_for(serv, pkg_name)
+                if _metadata["status"] == "exists":
+                    return jsonify(ComposeError.by_errcode(
+                        ERROR_CODES.CLIENT_REQUEST_OK, 
+                        _metadata["metadata"]
+                    )), 200
+            
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REQUEST_OK, _origin_metadata)), 200
+
+    return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REQUEST_OK, None)), 209
+
+@app.route("/api/server", methods=["POST", "GET"])
+async def server_api():
+    args = request.args
+    rtype = args.get("type")
+    pkg_name: str | None = args.get("name")
+    if rtype is None:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_ACTION_TYPE)), 403
+
+    if rtype in ["check-for", "copy-pkg"] and pkg_name is None:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
+    elif pkg_name is not None:
+        status, reason = pkg_name_formating(pkg_name)
+        if not status:
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_PKG_NAME, reason)), 403
+
+    match rtype:
+        case "check-for":
+            if package_exists(pkg_name):
+                return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
+                    "status": "exists",
+                    "metadata": pkg_metadata(pkg_name)
+                })), 200
+            
+            for serv in servers_db.all():
+                _metadata: dict = await _server_check_for(serv, pkg_name)
+                if _metadata["status"] == "exists":
+                    return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
+                        "status": "exists",
+                        "metadata": _metadata["metadata"]
+                    })), 200
+            
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
+                "status": "not-exists"
+            })), 200
+
+        case "copy-pkg":
+            if package_exists(pkg_name):
+                return send_file(
+                    os.path.join(ENV_PATH, PACKAGES_PATH, pkg_name + ".tar"), 
+                    as_attachment=True
+                ), 200
+            
+            for serv in servers_db.all():
+                _metadata: dict = await _server_copy_pkg(serv, pkg_name)
+                if _metadata["status"] == "exists":
+                    resp = send_file(
+                        os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"), 
+                        as_attachment=True
+                    )
+                    resp.call_on_close(
+                        lambda: os.remove(os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"))
+                    )
+
+                    return resp, 200
+
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
+                "status": "not-exists"
+            })), 209
+
+        case "hello":
+            servers_db.set(request.remote_addr, {"status": "exists"})
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, None)), 200
+
+    return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, None)), 403
+
+# ====================== DISTRIBUTION ========================
+
+@app.route("/scripts/client")
+async def script_client():
+    if NO_DISTRIBUTION:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
+
+    with open(
+        os.path.join(ENV_PATH, DISTROS_PATH, "client.sh")
+    ) as f:
+        return f.read(), 200
+    
+@app.route("/scripts/server")
+async def script_server():
+    if NO_DISTRIBUTION:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
+
+    with open(
+        os.path.join(ENV_PATH, DISTROS_PATH, "server.sh")
+    ) as f:
+        return f.read(), 200
+    
+@app.route("/scripts/upload")
+async def script_upload():
+    if NO_DISTRIBUTION:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
+
+    with open(
+        os.path.join(ENV_PATH, DISTROS_PATH, "upload.sh")
+    ) as f:
+        return f.read(), 200
+
+@app.route("/distribute")
+async def distribute():
+    if NO_DISTRIBUTION:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
+    
+    args = request.args
+    atype = args.get("type")
+    if atype is None:
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_ACTION_TYPE)), 403
+    
+    match atype:
+        case "client":
+            return send_file(
+                os.path.join(ENV_PATH, DISTROS_PATH, "client.tar"), 
+                as_attachment=True
+            )
+        case "uploader":
+            return send_file(
+                os.path.join(ENV_PATH, DISTROS_PATH, "upload.tar"), 
+                as_attachment=True
+            )
+        case "server":
+            return send_file(
+                os.path.join(ENV_PATH, DISTROS_PATH, "server.tar"), 
+                as_attachment=True
+            )
+
+    return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, None)), 403
+
+@app.route('/')
+async def index():
+    return "Hello world", 418
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument(
+        "-l", "--local",
+        required = True,
+        help = "Your server local (binding) format: IP:PORT"
+    )
+
+    parser.add_argument(
+        "-p", "--public",
+        required = True,
+        help = "Your server public (or any address via it can be accessed) format: http://IP:PORT"
+    )
+
+    parser.add_argument(
+        "-d", "--no-distro",
+        required = False,
+        action = "store_true",
+        default = False,
+        help = "Disallow distribution of service from current server"
+    )
+
+    parser.add_argument(
+        "-e", "--environ",
+        required = True,
+        type = str,
+        help = "Path to the enviroment for the server to operate"
+    )
+
+    parser.add_argument(
+        "-b", "--probe",
+        required = False,
+        type = str,
+        help = "Recomended param, provide path (in env) to file with ip-addresses (IP:PORT, one per line) of the known rbpkg-pm servers"
+    )
+
+    args = parser.parse_args()
+    if args.no_distro:
+        NO_DISTRIBUTION = True
+    
+    ENV_PATH = args.environ
+    PUBLIC_IP = args.public
+    ip, port = args.local.split(':')
+    
+    os.makedirs(ENV_PATH, exist_ok = True)
+    os.makedirs(os.path.join(ENV_PATH, TEMP_PATH), exist_ok = True)
+    os.makedirs(os.path.join(ENV_PATH, DISTROS_PATH), exist_ok = True)
+    os.makedirs(os.path.join(ENV_PATH, PACKAGES_PATH), exist_ok = True)
+    os.makedirs(os.path.join(ENV_PATH, TEMP_PATH), exist_ok = True)
+
+    packages_db = db.DataBase(f"{ENV_PATH}/packages.sqlite3")
+    servers_db  = db.DataBase(f"{ENV_PATH}/servers.sqlite3")
+
+    if args.probe:
+        if not os.path.exists(os.path.join(ENV_PATH, args.probe)):
+            print(f"[server][warning] probe file does not exists, please provide known hosts in format IP:PORT. Empty new line for exit")
+            content = ""
+            while True:
+                _inp = input("> ") or "quit"
+                if _inp == "quit":
+                    break
+                content += _inp + '\n'
+
+            with open(os.path.join(ENV_PATH, args.probe), 'w') as f:
+                f.write(content)
+
+        with open(os.path.join(ENV_PATH, args.probe)) as f:
+            domains = f.read().split('\n')
+        
+        for dm in domains:
+            print(f"[rbpkg] probing {dm}...", end = " ")
+            if sync_serv_hello(dm):
+                print(f"Ok")
+            else:
+                print(f"Failed")
+    
+
+    prepare_distros()
+    app.run(ip, int(port))

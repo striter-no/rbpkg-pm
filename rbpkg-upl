@@ -1,0 +1,163 @@
+#!/usr/bin/env python3
+import argparse, requests, os
+
+from src.uploader.package import pack_pkg
+
+def create_blank(env: str, name: str):
+    workingd = os.path.join(env, name)
+    
+    os.makedirs(os.path.join(workingd, "build"))
+    os.makedirs(os.path.join(workingd, "build", "code"))
+    os.makedirs(os.path.join(workingd, "build", "scripts"))
+    
+    with open(os.path.join(workingd, "README"), 'w') as f:
+        f.write(f"# {name}\n\nThis is a blank README. Change me!\n")
+    
+    with open(os.path.join(workingd, "rbpkg.version"), 'w') as f:
+        f.write(f"dev:0.0.1")
+    
+    with open(os.path.join(workingd, "rbpkg.install"), 'w') as f:
+        f.write(
+f"""#!/bin/bash
+
+echo -n "[script][install] {name} package "
+cat rbpkg.version
+printf "\\n";
+
+cat README
+printf "\\n";
+
+read -r -p "[script] continue [Y/n]" out
+[ "$out" == "n" ] && exit 1
+
+echo "building..."
+
+chmod +x ./rbpkg.build
+./rbpkg.build
+
+echo "[script][build] done"
+echo "[script] moving executables to the bin/"
+
+mkdir -p bin
+mv ./build/example ./bin/example
+
+echo "[script] done"
+"""
+        )
+    
+    with open(os.path.join(workingd, "rbpkg.build"), 'w') as f:
+        f.write(
+"""#!/bin/bash
+
+cd ./build
+chmod +x ./scripts/build.sh
+./scripts/build.sh
+"""
+        )
+
+    buildd = os.path.join(workingd, "build")
+    with open(os.path.join(buildd, "scripts", "build.sh"), 'w') as f:
+        f.write(f"gcc -o {name}_bin ./code/main.c")
+
+    with open(os.path.join(buildd, "code", "main.c"), 'w') as f:
+        f.write(
+"""#include <stdio.h>
+
+int main(){
+    printf("Hello world!\\n");
+}
+"""
+        )
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    
+    parser.add_argument(
+        "-b", "--blank",
+        action="store_true",  # Автоматически установит True при наличии флага
+        help="Create an empty package"
+    )
+
+    parser.add_argument(
+        "-e", "--environ",
+        required = True,
+        type = str,
+        help = "Directory with packages to upload"
+    )
+    
+    parser.add_argument(
+        "-p", "--package",
+        required = True,  
+        type = str, 
+        help = "Name of the directory with package"
+    )
+
+    parser.add_argument(
+        "-u", "--url",
+        type = str,
+        help = "URL to the reborn-pm server"
+    )
+
+    parser.add_argument(
+        "-k", "--key",
+        type = str,
+        help = "Key from server to update package (if exists)"
+    )
+
+    args = parser.parse_args()
+
+    if not args.blank:
+        missing = []
+        if not args.url: missing.append("-u/--url")
+        
+        if missing:
+            parser.error(
+                f"The following arguments are required (use --blank to skip): "
+                f"{', '.join(missing)}"
+            )
+    
+    if args.blank:
+        create_blank(args.environ, args.package)
+        exit(0)
+
+    status, reason = pack_pkg(args.environ, args.package)
+    if not status:
+        print(f"[rbpkg][uploader] failed to pack the \"{args.package}\" package: {reason}")
+        exit(-1)
+
+    packed_path = reason
+    server_path = (args.url if args.url[-1] != '/' else args.url[:-1])
+    server_path += "/api/uploader"
+
+    config_f = os.path.join(args.environ, ".config")
+    if os.path.exists(config_f):
+        with open(config_f, "r") as f:
+            _config_data = f.read()
+        pkgs = {name.strip(): key.strip() for (name, key) in [
+            l.split(':') for l in _config_data.split('\n')
+        ]}
+    else:
+        pkgs = dict()
+
+    answer = requests.post(
+        server_path,
+        params = {
+            "name": args.package,
+            "key": args.key or pkgs.get(args.package)
+        },
+        files = {
+            "file": open(packed_path, "rb")
+        }
+    )
+
+    data = answer.json()
+    print(f"[rbpkg][{answer.status_code}] {data["display"]}")
+    print(f"[rbpkg][status]: {data["error"]}/{data["code"]}")
+
+    if status < 100:
+        exit(status)
+
+    pkgs[args.package] = data["api_key"]
+
+    with open(config_f, 'w') as f:
+        f.write("\n".join([f"{k}:{v}" for (k, v) in pkgs.items()]))

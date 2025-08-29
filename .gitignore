@@ -1,0 +1,6 @@
+.protected
+vscode
+__pycache__
+venv
+*-env*
+test

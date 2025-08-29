@@ -1,0 +1,24 @@
+#!/bin/bash
+
+echo -n "[script][install] example package "
+cat rbpkg.version
+printf "\n";
+
+cat README
+printf "\n";
+
+read -r -p "[script] continue [Y/n]" out
+[ "$out" == "n" ] && exit 1
+
+echo "building..."
+
+chmod +x ./rbpkg.build
+./rbpkg.build
+
+echo "[script][build] done"
+echo "[script] moving executables to the bin/"
+
+mkdir -p bin
+mv ./build/example ./bin/example
+
+echo "[script] done"
