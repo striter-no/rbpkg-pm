@@ -6,7 +6,7 @@ import src.server.database as db
 import src.server.package as pkg
 import aiohttp, asyncio, logging
 
-from flask import Flask, request, jsonify, send_file
+from flask import Flask, request, jsonify, send_file, redirect
 
 from werkzeug.utils import secure_filename
 
@@ -322,33 +322,43 @@ def sync_serv_hello(serv_domain: str) -> bool:
 
 @app.route("/api/uploader", methods=["POST"])
 async def uploader_api():
+    print(f"[{request.remote_addr}][/api/uploader] uploader api request")
+
     pkg_name = request.args.get("name")
     if pkg_name is None:
+        print(f"[{request.remote_addr}][/api/uploader] package name is None")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
 
     status, reason = pkg_name_formating(pkg_name)
     if not status:
+        print(f"[{request.remote_addr}][/api/uploader] invalid package name: {reason}")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_PKG_NAME, reason)), 403
 
     api_key = request.args.get("key")
     if api_key is None and package_exists(pkg_name):
+        print(f"[{request.remote_addr}][/api/uploader] api key is None, but pacakge exists")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_API_KEY)), 403
     
     # Check in other servers
     if not package_exists(pkg_name):
+        print(f"[{request.remote_addr}][/api/uploader] checking existance in rbpkg network...")
         _stats = await _server_upload(pkg_name)
         if _stats["status"] != "not-exists":
+            print(f"[{request.remote_addr}][/api/uploader] found package at {_stats["route"]}")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REDIRECT, _stats["route"])), 202
 
     # Otherwise create new pacakge
     if api_key is not None and api_key != get_package_key(pkg_name):
+        print(f"[{request.remote_addr}][/api/uploader] found package at {_stats["route"]}. redirecting")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_API_KEY)), 403
 
     if 'file' not in request.files:
+        print(f"[{request.remote_addr}][/api/uploader] no input files")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_INPUT_FILES)), 403
     
     file = request.files['file']
     if file.filename is None or file.filename == '':
+        print(f"[{request.remote_addr}][/api/uploader] empty filename")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.EMPTY_FILENAME)), 403
 
     ver: str = ""
@@ -363,6 +373,7 @@ async def uploader_api():
         status, reason = pkg.check_package(current_pkg)
         if not status:
             current_pkg.close()
+            print(f"[{request.remote_addr}][/api/uploader] package currupted: {reason}")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, reason)), 403
 
         os.makedirs(os.path.join(
@@ -375,11 +386,13 @@ async def uploader_api():
             ver = version_f.read().decode("utf-8") or ""
         except:
             current_pkg.close()
+            print(f"[{request.remote_addr}][/api/uploader] package currupted: version should be encoded via utf-8 encoding")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, "version should be encoded via utf-8 encoding")), 403
 
         status, reason = check_version_formatting(ver)
         if not status:
             current_pkg.close()
+            print(f"[{request.remote_addr}][/api/uploader] package currupted: {reason}")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, reason)), 403
 
         memb = current_pkg.getmember("README")
@@ -388,11 +401,13 @@ async def uploader_api():
             readme = readme_f.read().decode("utf-8") or ""
         except:
             current_pkg.close()
+            print(f"[{request.remote_addr}][/api/uploader] package currupted: readme should be encoded via utf-8 encoding")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.PACKAGE_CURRUPTED, "readme should be encoded via utf-8 encoding")), 403
 
         current_pkg.close()
         shutil.move(path, os.path.join(ENV_PATH, PACKAGES_PATH, pkg_name + ".tar"))
     else:
+        print(f"[{request.remote_addr}][/api/uploader] disallowed file: {file.filename} ({file.filename.rsplit('.', 1)[1]})")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.DISALLOWED_FILE, ALLOWED_EXT)), 403
 
     api_key = api_key or str(uuid.uuid4())
@@ -403,40 +418,53 @@ async def uploader_api():
         readme = readme
     )
 
+    print(f"[{request.remote_addr}][/api/uploader] upload succsesfull")
     return jsonify(ComposeError.by_errcode(ERROR_CODES.UPLOADED_SUCCSESFULL, api_key)), 200
 
 @app.route("/api/client")
 async def client_api():
+    print(f"[{request.remote_addr}][/api/client] client api request")
     pkg_name = request.args.get("name")
     action   = request.args.get("action")
 
     if pkg_name is None:
+        print(f"[{request.remote_addr}][/api/client] package name is None")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
 
     status, reason = pkg_name_formating(pkg_name)
     if not status:
+        print(f"[{request.remote_addr}][/api/client] invalid package name formating")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_PKG_NAME, reason)), 403
 
-    if action not in ["install", "check"]:
+    if not action:
+        print(f"[{request.remote_addr}][/api/client] action is none")
+        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_ACTION_TYPE, action)), 403
+
+    if action and action not in ["install", "check"]:
+        print(f"[{request.remote_addr}][/api/client] invalid action: {action[:20].replace('\n', '  ')}")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, action)), 403
 
     if action == "install":
         if not package_exists(pkg_name):
+            print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package does not exist in local DB")
             for serv in servers_db.all():
                 _metadata: dict = await _server_copy_pkg(serv, pkg_name)
                 if _metadata["status"] == "exists":
+                    print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package was found in {serv}")
                     resp = send_file(
                         os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"), 
                         as_attachment=True
                     )
+                    print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] sending temporal pacakge: {_metadata["temp-name"]}")
                     resp.call_on_close(
                         lambda: os.remove(os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"))
                     )
 
                     return resp, 200
-            
+            print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package was not found in local DB, nor is rbpkg network")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_SUCH_PKG)), 403
 
+        print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package does exist in local DB")
         return send_file(
             os.path.join(ENV_PATH, PACKAGES_PATH, pkg_name + ".tar"), 
             as_attachment=True
@@ -445,151 +473,186 @@ async def client_api():
         _origin_metadata = pkg_metadata(pkg_name)
 
         if _origin_metadata["exists"]:
+            print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package does exist in local DB")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REQUEST_OK, _origin_metadata)), 200
         else:
+            
             for serv in servers_db.all():
                 _metadata: dict = await _server_check_for(serv, pkg_name)
                 if _metadata["status"] == "exists":
+                    print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package was found in {serv}")
                     return jsonify(ComposeError.by_errcode(
                         ERROR_CODES.CLIENT_REQUEST_OK, 
                         _metadata["metadata"]
                     )), 200
             
+            print(f"[{request.remote_addr}][/api/client][{pkg_name}-{action}] package was not found in local DB, nor is rbpkg network")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REQUEST_OK, _origin_metadata)), 200
 
-    return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REQUEST_OK, None)), 209
+    print(f"[{request.remote_addr}][/api/client][{pkg_name}] invalid action somehow: {action[:50].replace('\n', '  ')}")
+    return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, None)), 403
 
 @app.route("/api/server", methods=["POST", "GET"])
 async def server_api():
+    print(f"[{request.remote_addr}][/api/server] server api request")
     args = request.args
     rtype = args.get("type")
     pkg_name: str | None = args.get("name")
     if rtype is None:
+        print(f"[{request.remote_addr}][/api/server] no action type")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_ACTION_TYPE)), 403
 
     if rtype in ["check-for", "copy-pkg", "upl-pkg"] and pkg_name is None:
+        print(f"[{request.remote_addr}][/api/server] no pacakge name (action: {rtype})")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
     elif pkg_name is not None:
         status, reason = pkg_name_formating(pkg_name)
         if not status:
+            print(f"[{request.remote_addr}][/api/server] invalid pkg name: {reason}")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_PKG_NAME, reason)), 403
 
     match rtype:
         case "check-for":
             if package_exists(pkg_name):
+                print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package exists")
                 return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
                     "status": "exists",
                     "metadata": pkg_metadata(pkg_name),
                     "route": PUBLIC_IP
                 })), 200
             
+            print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package does not exists in local DB")
             for serv in servers_db.all():
                 _metadata: dict = await _server_check_for(serv, pkg_name)
                 if _metadata["status"] == "exists":
+                    print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package exists in DB of the {serv}")
                     return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
                         "status": "exists",
                         "metadata": _metadata["metadata"],
                         "route": _metadata["route"]
                     })), 200
             
+            print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package does not exists in local DB, nor in rbpkg network")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
                 "status": "not-exists"
             })), 200
 
         case "copy-pkg":
             if package_exists(pkg_name):
+                print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package exists")
                 return send_file(
                     os.path.join(ENV_PATH, PACKAGES_PATH, pkg_name + ".tar"), 
                     as_attachment=True
                 ), 200
             
+            print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package does not exists in local DB")
             for serv in servers_db.all():
                 _metadata: dict = await _server_copy_pkg(serv, pkg_name)
                 if _metadata["status"] == "exists":
+                    print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package exists in DB of the {serv}")
                     resp = send_file(
                         os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"), 
                         as_attachment=True
                     )
+                    print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] acquired temporal pacakge {_metadata["temp-name"]}")
                     resp.call_on_close(
                         lambda: os.remove(os.path.join(ENV_PATH, TEMP_PATH, _metadata["temp-name"] + ".tar"))
                     )
 
                     return resp, 200
 
+            print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] package does not exists in local DB, nor in rbpkg network")
             return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
                 "status": "not-exists"
             })), 209
 
         case "hello":
+            print(f"[{request.remote_addr}][/api/server][{pkg_name}-{rtype}] probing from remote host")
             servers_db.set(request.remote_addr, {"status": "exists"})
             return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, None)), 200
 
+    print(f"[{request.remote_addr}][/api/server][{pkg_name}] invalid action from remote host: {rtype[:20].replace('\n', '  ')}")
     return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, None)), 403
 
 # ====================== DISTRIBUTION ========================
 
 @app.route("/scripts/client")
 async def script_client():
+    print(f"[{request.remote_addr}][/scripts/client] attempt to get script")
     if NO_DISTRIBUTION:
-        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
+        print(f"[{request.remote_addr}][/scripts/client] denied (no distribution)")
 
     with open(
         os.path.join(ENV_PATH, DISTROS_PATH, "client.sh")
     ) as f:
+        print(f"[{request.remote_addr}][/scripts/client] read {os.path.join(ENV_PATH, DISTROS_PATH, "client.sh")}")
         return f.read(), 200
     
 @app.route("/scripts/server")
 async def script_server():
+    print(f"[{request.remote_addr}][/scripts/server] attempt to get script")
     if NO_DISTRIBUTION:
-        return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
+        print(f"[{request.remote_addr}][/scripts/server] denied (no distribution)")
 
     with open(
         os.path.join(ENV_PATH, DISTROS_PATH, "server.sh")
     ) as f:
+        print(f"[{request.remote_addr}][/scripts/server] read {os.path.join(ENV_PATH, DISTROS_PATH, "server.sh")}")
         return f.read(), 200
     
 @app.route("/scripts/upload")
 async def script_upload():
+    print(f"[{request.remote_addr}][/scripts/upload] attempt to get script")
     if NO_DISTRIBUTION:
+        print(f"[{request.remote_addr}][/scripts/upload] denied (no distribution)")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
 
     with open(
         os.path.join(ENV_PATH, DISTROS_PATH, "upload.sh")
     ) as f:
+        print(f"[{request.remote_addr}][/scripts/upload] read {os.path.join(ENV_PATH, DISTROS_PATH, "upload.sh")}")
         return f.read(), 200
 
 @app.route("/distribute")
 async def distribute():
+    print(f"[{request.remote_addr}][/distribute] attempt to get distros")
     if NO_DISTRIBUTION:
+        print(f"[{request.remote_addr}][/distribute] denied (no distribution)")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_DISTRIBUTION)), 403 
     
     args = request.args
     atype = args.get("type")
     if atype is None:
+        print(f"[{request.remote_addr}][/distribute] type is None")
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_ACTION_TYPE)), 403
     
     match atype:
         case "client":
+            print(f"[{request.remote_addr}][/distribute] requested client")
             return send_file(
                 os.path.join(ENV_PATH, DISTROS_PATH, "client.tar"), 
                 as_attachment=True
             )
         case "uploader":
+            print(f"[{request.remote_addr}][/distribute] requested uploader")
             return send_file(
                 os.path.join(ENV_PATH, DISTROS_PATH, "upload.tar"), 
                 as_attachment=True
             )
         case "server":
+            print(f"[{request.remote_addr}][/distribute] requested server")
             return send_file(
                 os.path.join(ENV_PATH, DISTROS_PATH, "server.tar"), 
                 as_attachment=True
             )
 
+    print(f"[{request.remote_addr}][/distribute] requested unkown: {atype[:20].replace('\n', ' ')}")
     return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_ACTION, None)), 403
 
 @app.route('/')
 async def index():
-    return "Hello world", 418
+    print(f"[{request.remote_addr}][/] what the heck?")
+    return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), 418
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
