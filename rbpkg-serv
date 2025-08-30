@@ -233,20 +233,26 @@ def pkg_metadata(name: str):
     }
 
 async def _server_check_for(serv_domain: str, pkg: str) -> dict:
-    async with aiohttp.ClientSession(base_url=f"http://{serv_domain}") as session:
-        async with session.post("/api/server", params = {
-            "type": "check-for",
-            "name": pkg
-        }) as req:
-            data = (await req.json())["metadata"]
-            status = data["status"]
-            metadata = data["metadata"]
+    try:
+        async with aiohttp.ClientSession(base_url=f"http://{serv_domain}") as session:
+            async with session.post("/api/server", params = {
+                "type": "check-for",
+                "name": pkg
+            }) as req:
+                data = (await req.json())["metadata"]
+                status = data["status"]
+                metadata = data["metadata"]
 
-            return {
-                "status": status,
-                "metadata": metadata,
-                "route": data["route"]
-            }
+                return {
+                    "status": status,
+                    "metadata": metadata,
+                    "route": data["route"]
+                }
+    except:
+        print(f"[_server_check_for] failed with server: http://{serv_domain}/api/server")
+        return {
+            "status": "not-exists"
+        }
 
 async def _server_copy_pkg(serv_domain: str, pkg: str) -> dict:
     async with aiohttp.ClientSession(base_url=f"http://{serv_domain}") as session:
@@ -652,7 +658,7 @@ async def distribute():
 @app.route('/')
 async def index():
     print(f"[{request.remote_addr}][/] what the heck?")
-    return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ"), 418
+    return redirect("https://www.youtube.com/watch?v=dQw4w9WgXcQ", code=302)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()

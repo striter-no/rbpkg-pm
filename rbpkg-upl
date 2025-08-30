@@ -146,14 +146,18 @@ if __name__ == "__main__":
         server_path,
         params = {
             "name": args.package,
-            "key": args.key or pkgs.get(args.package)
+            "key": pkgs.get(args.package)
         },
         files = {
             "file": open(packed_path, "rb")
         }
     )
 
-    data = answer.json()
+    try:
+        data = answer.json()
+    except Exception as ex:
+        print(f"[rbpkg][error] failed to upload package")
+        exit(-100)
 
     # Redirect
     if answer.status_code == 202:
@@ -169,7 +173,11 @@ if __name__ == "__main__":
                 "file": open(packed_path, "rb")
             }
         )
-        data = answer.json()
+        try:
+            data = answer.json()
+        except Exception as ex:
+            print(f"[rbpkg][error] failed to upload package")
+            exit(-100)
 
     print(f"[rbpkg][{answer.status_code}] {data["display"]}")
     print(f"[rbpkg][{data["code"]}] {data["error"]}")

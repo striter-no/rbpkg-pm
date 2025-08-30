@@ -58,6 +58,7 @@ def install(package: str):
     versions[package] = new_ver
 
     downloads_d = os.path.join(ENVIRONMENT, ".downloads")
+    bins_d = os.path.join(ENVIRONMENT, ".bin")
     print(f"[rbpkg] saving to tmp file: {os.path.join(downloads_d, f"{package}.tar")}")
 
     os.makedirs(downloads_d, exist_ok = True)
@@ -84,20 +85,35 @@ def install(package: str):
 
     print(f"[rbpkg] fixing package in stable directory")
     os.makedirs(os.path.join(ENVIRONMENT, ".bin"), exist_ok = True)
-    for el in os.listdir(
-        os.path.join(downloads_d, package, "bin")
-    ):
-        print(f"[rbpkg] moving new bin: {el}...")
-        if os.path.exists(os.path.join(ENVIRONMENT, ".bin", el)):
-            _repl = input(f"[rbpkg][installation] replace old \"{el}\" with new? [Y/n] ") or "Y"
-            if _repl != "Y":
-                continue
-            os.remove(os.path.join(ENVIRONMENT, ".bin", el))
+    if os.path.exists(os.path.join(downloads_d, package, "bin")):
+        for el in os.listdir(
+            os.path.join(downloads_d, package, "bin")
+        ):
+            print(f"[rbpkg] moving new bin: {el}...")
+            if os.path.exists(os.path.join(ENVIRONMENT, ".bin", el)):
+                _repl = input(f"[rbpkg][installation] replace old \"{el}\" with new? [Y/n] ") or "Y"
+                if _repl != "Y":
+                    continue
+                os.remove(os.path.join(ENVIRONMENT, ".bin", el))
 
-        shutil.move(
-            os.path.join(downloads_d, package, "bin", el),
-            os.path.join(ENVIRONMENT, ".bin"),
-        )
+            shutil.move(
+                os.path.join(downloads_d, package, "bin", el),
+                os.path.join(ENVIRONMENT, ".bin"),
+            )
+    elif os.path.exists(os.path.join(bins_d, package)):
+        dst_dir = input(f"[rbpkg][installation] enter path to extract new package content (empty for current dir): ") or "./"
+        
+        src_dir = os.path.join(bins_d, package)
+        for item in os.listdir(src_dir):
+            src_path = os.path.join(src_dir, item)
+            dst_path = os.path.join(dst_dir, item)
+            
+            if os.path.isdir(src_path):
+                shutil.copytree(src_path, dst_path, dirs_exist_ok = True)
+            else:
+                shutil.copy2(src_path, dst_path)
+
+        # shutil.rmtree(os.path.join(bins_d, package))
 
     os.remove(os.path.join(downloads_d, f"{package}.tar"))
     shutil.rmtree(os.path.join(downloads_d, package))
