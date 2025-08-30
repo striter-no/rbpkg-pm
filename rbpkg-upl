@@ -138,6 +138,9 @@ if __name__ == "__main__":
         ]}
     else:
         pkgs = dict()
+    
+    if args.key:
+        pkgs[args.package] = args.key
 
     answer = requests.post(
         server_path,
@@ -151,9 +154,27 @@ if __name__ == "__main__":
     )
 
     data = answer.json()
-    print(f"[rbpkg][{answer.status_code}] {data["display"]}")
-    print(f"[rbpkg][status]: {data["error"]}/{data["code"]}")
 
+    # Redirect
+    if answer.status_code == 202:
+        _path = data["route"] if data["route"][-1] != '/' else data["route"][:-1]
+        print(f"[rbpkg][warning] redirecting to the \"{_path}\"")
+        answer = requests.post(
+            _path + "/api/uploader",
+            params = {
+                "name": args.package,
+                "key": pkgs.get(args.package)
+            },
+            files = {
+                "file": open(packed_path, "rb")
+            }
+        )
+        data = answer.json()
+
+    print(f"[rbpkg][{answer.status_code}] {data["display"]}")
+    print(f"[rbpkg][{data["code"]}] {data["error"]}")
+
+    status = data["code"]
     if status < 100:
         exit(status)
 

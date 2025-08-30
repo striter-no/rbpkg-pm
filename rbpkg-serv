@@ -244,7 +244,8 @@ async def _server_check_for(serv_domain: str, pkg: str) -> dict:
 
             return {
                 "status": status,
-                "metadata": metadata
+                "metadata": metadata,
+                "route": data["route"]
             }
 
 async def _server_copy_pkg(serv_domain: str, pkg: str) -> dict:
@@ -295,6 +296,27 @@ async def _server_hello(serv_domain: str) -> bool:
         )
         return False
 
+async def _server_upload(pkg: str) -> dict:
+    if package_exists(pkg):
+        return {
+            "status": "exists",
+            "metadata": pkg_metadata(pkg),
+            "route": PUBLIC_IP
+        }
+    
+    for serv in servers_db.all():
+        _metadata: dict = await _server_check_for(serv, pkg)
+        if _metadata["status"] == "exists":
+            return {
+                "status": "exists",
+                "metadata": _metadata["metadata"],
+                "route": _metadata["route"]
+            }
+    
+    return {
+        "status": "not-exists"
+    }
+
 def sync_serv_hello(serv_domain: str) -> bool:
     return asyncio.run(_server_hello(serv_domain))
 
@@ -312,6 +334,13 @@ async def uploader_api():
     if api_key is None and package_exists(pkg_name):
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_API_KEY)), 403
     
+    # Check in other servers
+    if not package_exists(pkg_name):
+        _stats = await _server_upload(pkg_name)
+        if _stats["status"] != "not-exists":
+            return jsonify(ComposeError.by_errcode(ERROR_CODES.CLIENT_REDIRECT, _stats["route"])), 202
+
+    # Otherwise create new pacakge
     if api_key is not None and api_key != get_package_key(pkg_name):
         return jsonify(ComposeError.by_errcode(ERROR_CODES.INVALID_API_KEY)), 403
 
@@ -438,7 +467,7 @@ async def server_api():
     if rtype is None:
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_ACTION_TYPE)), 403
 
-    if rtype in ["check-for", "copy-pkg"] and pkg_name is None:
+    if rtype in ["check-for", "copy-pkg", "upl-pkg"] and pkg_name is None:
         return jsonify(ComposeError.by_errcode(ERROR_CODES.NO_PKG_NAME)), 403
     elif pkg_name is not None:
         status, reason = pkg_name_formating(pkg_name)
@@ -450,7 +479,8 @@ async def server_api():
             if package_exists(pkg_name):
                 return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
                     "status": "exists",
-                    "metadata": pkg_metadata(pkg_name)
+                    "metadata": pkg_metadata(pkg_name),
+                    "route": PUBLIC_IP
                 })), 200
             
             for serv in servers_db.all():
@@ -458,7 +488,8 @@ async def server_api():
                 if _metadata["status"] == "exists":
                     return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {
                         "status": "exists",
-                        "metadata": _metadata["metadata"]
+                        "metadata": _metadata["metadata"],
+                        "route": _metadata["route"]
                     })), 200
             
             return jsonify(ComposeError.by_errcode(ERROR_CODES.SERVER_REQUEST_OK, {

@@ -19,6 +19,7 @@ class ERROR_CODES(enum.Enum):
     # -- Success statuses
     UPLOADED_SUCCSESFULL = 100
     CLIENT_REQUEST_OK    = 101
+    CLIENT_REDIRECT      = 102
 
     # -- Server sc statuses
     SERVER_REQUEST_OK    = 150
@@ -55,6 +56,8 @@ class ComposeError:
                 return ComposeError._uploaded_succsess(*args)
             case ERROR_CODES.CLIENT_REQUEST_OK:
                 return ComposeError._client_ok(*args)
+            case ERROR_CODES.CLIENT_REDIRECT:
+                return ComposeError._cli_redirect(*args)
 
             case ERROR_CODES.SERVER_REQUEST_OK:
                 return ComposeError._server_ok(*args)
@@ -172,6 +175,17 @@ class ComposeError:
             "error": "OK",
             "code": ERROR_CODES.CLIENT_REQUEST_OK.value
         }
+    
+    @staticmethod
+    def _cli_redirect(route: str) -> dict:
+        return {
+            "route": route,
+            "display": f"client redirect to {route}",
+            "error": "OK",
+            "code": ERROR_CODES.CLIENT_REDIRECT.value
+        }
+
+    # -- Server side
     
     @staticmethod
     def _server_ok(metadata: None | dict) -> dict:
